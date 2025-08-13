@@ -1,6 +1,6 @@
-# Qwen2.5-VL-3B 图像美学分析系统
+# Qwen2.5-VL-3B 统一图像美学分析系统
 
-基于 MLX 框架的 Qwen2.5-VL-3B 模型本地部署，专门用于图像美学分析和评价。
+基于 MLX 框架的 Qwen2.5-VL-3B 模型本地部署，专门用于图像美学分析和评价。现已整合为单个Python文件，提供流式输出功能。
 
 ## 项目概述
 
@@ -11,9 +11,10 @@
 - 🎨 **多维度美学分析**: 从构图、焦段、对比度&曝光度&亮度等维度进行专业评价
 - 🔢 **量化评分系统**: 每个维度提供 1-10 分的量化评分
 - 📊 **结构化输出**: 支持文本报告和 JSON 格式的结构化数据输出
-- 🖼️ **批量处理**: 支持单张图像或批量处理多张图像
-- 📈 **汇总报告**: 多张图像分析后自动生成汇总统计报告
+- 🌊 **流式输出**: 实时流式显示分析过程，提升用户体验
+- 📁 **统一文件**: 所有功能整合在单个Python文件中，便于部署和使用
 - 🚀 **GPU 加速**: 基于 MLX 框架，充分利用 Apple Silicon 的性能优势
+- 🔧 **灵活调用**: 提供主函数 `infer_with_qwen` 便于集成到其他项目
 
 ## 文件结构
 
@@ -27,9 +28,7 @@ qwen_infer_python_local/
 │   └── ...                       # 其他模型文件
 ├── demo.png                       # 示例图像
 ├── qwen_vl_3b_prompt.txt         # 美学分析提示模板
-├── qwen_vl_inference.py          # 核心推理引擎
-├── aesthetic_analyzer.py         # 美学分析器
-├── run_aesthetic_analysis.py     # 主运行脚本
+├── qwen_vl_unified.py            # 统一推理脚本（主文件）
 ├── requirements.txt              # Python 依赖
 └── README.md                     # 本文档
 ```
@@ -64,40 +63,54 @@ pip install mlx mlx-lm
 
 ## 使用方法
 
-### 基本使用
+### 快速开始
 
 ```bash
-# 分析单张图像
-python run_aesthetic_analysis.py demo.png
+# 运行演示模式（推荐）
+python qwen_vl_unified.py --demo
 
-# 分析指定目录下的所有图像
-python run_aesthetic_analysis.py /path/to/images/
+# 分析指定图像
+python qwen_vl_unified.py --image demo.png --prompt-file qwen_vl_3b_prompt.txt
 
-# 指定输出目录
-python run_aesthetic_analysis.py demo.png --output-dir ./results
+# 使用自定义提示
+python qwen_vl_unified.py --image demo.png --prompt "请对这张图片进行详细的美学分析"
 ```
 
-### 高级参数
+### Python API 调用
+
+```python
+from qwen_vl_unified import infer_with_qwen
+
+# 流式推理
+for chunk in infer_with_qwen(prompt="请分析这张图片", 
+                            image_path="demo.png", 
+                            model_path="./Models"):
+    print(chunk, end='', flush=True)
+```
+
+### 命令行参数
 
 ```bash
-python run_aesthetic_analysis.py <图像路径> \
+python qwen_vl_unified.py \
+    --image <图像路径> \              # 图像文件路径
+    --prompt <提示文本> \             # 自定义提示文本
+    --prompt-file <提示文件> \        # 提示文件路径
     --model-path ./Models \           # 模型路径
-    --prompt-file ./qwen_vl_3b_prompt.txt \  # 提示文件
-    --output-dir ./output \           # 输出目录
     --device gpu \                    # 运行设备 (gpu/cpu)
-    --log-level INFO \                # 日志级别
-    --max-tokens 2048                 # 最大生成 token 数
+    --no-stream \                     # 禁用流式输出
+    --log-level INFO                  # 日志级别
 ```
 
 ### 参数说明
 
-- `image_path`: 要分析的图像文件或包含图像的目录路径
-- `--model-path`: Qwen2.5-VL-3B 模型文件所在目录 (默认: ./Models)
+- `--demo`: 运行演示模式，使用默认的demo.png和提示文件
+- `--image`: 要分析的图像文件路径
+- `--prompt`: 直接指定提示文本
 - `--prompt-file`: 美学分析提示模板文件路径 (默认: ./qwen_vl_3b_prompt.txt)
-- `--output-dir`: 分析结果输出目录 (默认: ./output)
+- `--model-path`: Qwen2.5-VL-3B 模型文件所在目录 (默认: ./Models)
 - `--device`: 运行设备，gpu 或 cpu (默认: gpu)
+- `--no-stream`: 禁用流式输出，一次性显示完整结果
 - `--log-level`: 日志输出级别 (默认: INFO)
-- `--max-tokens`: 模型生成的最大 token 数量 (默认: 2048)
 
 ## 输出格式
 
@@ -158,60 +171,66 @@ python run_aesthetic_analysis.py <图像路径> \
 }
 ```
 
-### 汇总报告
+### 流式输出
 
-批量分析多张图像时，会自动生成汇总统计报告：
+系统支持实时流式输出，分析过程会逐步显示：
 
 ```
-============================================================
-图像美学分析汇总报告
-============================================================
+=== Qwen2.5-VL-3B 流式美学分析演示 ===
 
-分析图像总数: 5
+分析图像: demo.png
+使用模型: /path/to/Models
 
-【平均评分】
-- 综合评分: 7.45/10
-- 构图评分: 7.20/10
-- 焦段评分: 7.60/10
-- 对比度&曝光度&亮度评分: 7.55/10
+开始流式分析...
 
-【最佳表现】
-图像: best_photo.jpg
-综合评分: 8.9/10
+------------------------------------------------------------
+维度分析与评分：
+- 构图：采用了较为传统的海景构图，前景的岩石形成了天然的引导线，
+将视线引向远处的海平面...评分：7.2分
+- 焦段：使用适中焦段拍摄，透视效果自然...评分：7.8分  
+- 对比度&曝光度&亮度：画面对比度适中...评分：8.1分
 
-【需要改进】
-图像: needs_improvement.jpg
-综合评分: 6.1/10
+综合评分：7.7（1-10分）
+
+综合评价与建议：这是一幅较为标准的海岸风光摄影作品...
+------------------------------------------------------------
+
+✅ 流式分析完成!
 ```
 
-## 核心模块说明
+## 核心功能说明
 
-### qwen_vl_inference.py
+### qwen_vl_unified.py
 
-核心推理引擎，负责：
-- 模型加载和初始化
-- 图像预处理
-- 文本提示处理
-- MLX 框架的推理执行
-- 响应生成
+统一推理脚本，整合了所有功能：
 
-### aesthetic_analyzer.py
+#### 主要类
 
-美学分析器，负责：
-- 模型响应解析
-- 结构化数据提取
-- 评分计算
-- 报告格式化
-- JSON 数据保存
+- **QwenVLInference**: 核心推理引擎
+  - 模型加载和初始化
+  - 图像预处理
+  - 文本提示处理
+  - MLX 框架的推理执行
+  - 流式响应生成
 
-### run_aesthetic_analysis.py
+- **AestheticAnalyzer**: 美学分析器
+  - 模型响应解析
+  - 结构化数据提取
+  - 评分计算
+  - 报告格式化
 
-主运行脚本，提供：
-- 命令行接口
-- 批量处理功能
-- 进度监控
-- 错误处理
-- 汇总报告生成
+#### 主要函数
+
+- **infer_with_qwen()**: 主推理函数
+  ```python
+  def infer_with_qwen(prompt: str, image_path: str, 
+                     model_path: str = "./Models", 
+                     device: str = "gpu", 
+                     stream: bool = True) -> Generator[str, None, None]
+  ```
+  
+- **demo_stream_inference()**: 演示模式
+- **main()**: 命令行入口
 
 ## 性能优化
 
@@ -235,12 +254,13 @@ else:
 - 支持量化模型以减少内存占用
 - 批处理时自动内存释放
 
-### 并行处理
+### 流式处理
 
-当前版本支持单张图像处理，未来版本计划支持：
-- 多图像并行推理
-- 异步 I/O 操作
-- 流式处理大批量图像
+当前版本特色：
+- 实时流式文本输出
+- 低延迟的响应展示
+- 优化的内存使用模式
+- 可中断的推理过程
 
 ## 故障排除
 
@@ -271,32 +291,35 @@ else:
 使用调试模式获取详细日志信息：
 
 ```bash
-python run_aesthetic_analysis.py demo.png --log-level DEBUG
+python qwen_vl_unified.py --image demo.png --log-level DEBUG
 ```
 
 ## 开发说明
 
 ### 扩展功能
 
-要添加新的分析维度，需要修改：
-1. `qwen_vl_3b_prompt.txt` - 更新提示模板
-2. `aesthetic_analyzer.py` - 添加解析逻辑
-3. `AestheticScore` 数据类 - 添加新的评分字段
+要添加新的分析维度，需要在 `qwen_vl_unified.py` 中修改：
+1. 更新 `AestheticScore` 数据类 - 添加新的评分字段
+2. 修改 `AestheticAnalyzer.parse_response()` - 添加解析逻辑  
+3. 更新 `qwen_vl_3b_prompt.txt` - 更新提示模板
 
 ### 模型适配
 
 要适配其他 MLX 兼容的视觉语言模型：
-1. 修改 `qwen_vl_inference.py` 中的模型加载逻辑
-2. 调整图像预处理参数
-3. 更新文本编码方式
+1. 修改 `QwenVLInference` 类中的模型加载逻辑
+2. 调整 `preprocess_image()` 中的图像预处理参数
+3. 更新 `preprocess_text()` 中的文本编码方式
 
-### Swift 迁移准备
+### 集成到其他项目
 
-当前 Python 实现为后续 Swift 移植做了以下准备：
-- 清晰的模块化设计
-- 标准化的数据结构
-- MLX 框架的统一使用
-- 详细的接口文档
+由于所有功能都在单个文件中，可以轻松集成：
+
+```python
+# 作为模块导入
+from qwen_vl_unified import infer_with_qwen, QwenVLInference
+
+# 或者直接复制 infer_with_qwen 函数到你的项目中
+```
 
 ## 许可证
 

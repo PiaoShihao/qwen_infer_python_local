@@ -5,6 +5,8 @@
 ## 项目概述
 这是一个基于本地的位于 Models 文件夹下的Qwen2.5-VL-3B 模型，使用 mlx 完成部署，可以基于 demo.png和qwen_vl_3b_prompt.txt完成多模态的推理，来提供对于相片的美学分析。
 
+现已整合为单个Python文件 `qwen_vl_unified.py`，提供流式输出的图像美学分析功能。主要函数是 `infer_with_qwen(prompt, image_path)`，支持流式生成美学分析结果。
+
 执行 git commit 时，commit 信息优先使用中文。
 
 你的projection显示会超出token限制。要多用实际token，少用projection，Claude Code减少projection使用的策略是：
