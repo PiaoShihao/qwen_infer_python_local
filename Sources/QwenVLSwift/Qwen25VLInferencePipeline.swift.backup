@@ -143,7 +143,7 @@ public class Qwen25VLInferencePipeline {
     private func loadLanguageModelWeights(_ weights: [String: MLXArray]) {
         // Embedding
         if let embeddingWeight = weights["language_model.model.embed_tokens.weight"] {
-            model.languageModel.embedding.weight = embeddingWeight
+            model.languageModel.embedding.update(parameters: ModuleParameters(values: ["weight": .value(embeddingWeight)]))
         }
         
         // Decoder layers
@@ -152,44 +152,44 @@ public class Qwen25VLInferencePipeline {
             
             // Self attention
             if let qWeight = weights["\(layerPrefix).self_attn.q_proj.weight"] {
-                model.languageModel.layers[i].selfAttention.qProj.weight = qWeight
+                model.languageModel.layers[i].selfAttention.qProj.update(parameters: ModuleParameters(["weight": qWeight]))
             }
             if let kWeight = weights["\(layerPrefix).self_attn.k_proj.weight"] {
-                model.languageModel.layers[i].selfAttention.kProj.weight = kWeight
+                model.languageModel.layers[i].selfAttention.kProj.update(parameters: ModuleParameters(["weight": kWeight]))
             }
             if let vWeight = weights["\(layerPrefix).self_attn.v_proj.weight"] {
-                model.languageModel.layers[i].selfAttention.vProj.weight = vWeight
+                model.languageModel.layers[i].selfAttention.vProj.update(parameters: ModuleParameters(["weight": vWeight]))
             }
             if let oWeight = weights["\(layerPrefix).self_attn.o_proj.weight"] {
-                model.languageModel.layers[i].selfAttention.oProj.weight = oWeight
+                model.languageModel.layers[i].selfAttention.oProj.update(parameters: ModuleParameters(["weight": oWeight]))
             }
             
             // MLP
             if let gateWeight = weights["\(layerPrefix).mlp.gate_proj.weight"] {
-                model.languageModel.layers[i].mlp.gateProj.weight = gateWeight
+                model.languageModel.layers[i].mlp.gateProj.update(parameters: ModuleParameters(["weight": gateWeight]))
             }
             if let upWeight = weights["\(layerPrefix).mlp.up_proj.weight"] {
-                model.languageModel.layers[i].mlp.upProj.weight = upWeight
+                model.languageModel.layers[i].mlp.upProj.update(parameters: ModuleParameters(["weight": upWeight]))
             }
             if let downWeight = weights["\(layerPrefix).mlp.down_proj.weight"] {
-                model.languageModel.layers[i].mlp.downProj.weight = downWeight
+                model.languageModel.layers[i].mlp.downProj.update(parameters: ModuleParameters(["weight": downWeight]))
             }
             
             // Layer norms
             if let inputNormWeight = weights["\(layerPrefix).input_layernorm.weight"] {
-                model.languageModel.layers[i].inputLayerNorm.weight = inputNormWeight
+                model.languageModel.layers[i].inputLayerNorm.update(parameters: ModuleParameters(["weight": inputNormWeight]))
             }
             if let postNormWeight = weights["\(layerPrefix).post_attention_layernorm.weight"] {
-                model.languageModel.layers[i].postAttentionLayerNorm.weight = postNormWeight
+                model.languageModel.layers[i].postAttentionLayerNorm.update(parameters: ModuleParameters(["weight": postNormWeight]))
             }
         }
         
         // Final norm and lm_head
         if let normWeight = weights["language_model.model.norm.weight"] {
-            model.languageModel.norm.weight = normWeight
+            model.languageModel.norm.update(parameters: ModuleParameters(["weight": normWeight]))
         }
         if let lmHeadWeight = weights["language_model.lm_head.weight"] {
-            model.languageModel.lmHead.weight = lmHeadWeight
+            model.languageModel.lmHead.update(parameters: ModuleParameters(["weight": lmHeadWeight]))
         }
     }
     
@@ -199,7 +199,7 @@ public class Qwen25VLInferencePipeline {
         
         // Patch embedding
         if let patchWeight = weights["\(visionPrefix).patch_embed.proj.weight"] {
-            model.visionTower.patchEmbedding.weight = patchWeight
+            model.visionTower.patchEmbedding.update(parameters: ModuleParameters(["weight": patchWeight]))
         }
         
         // Position embedding
@@ -231,31 +231,31 @@ public class Qwen25VLInferencePipeline {
             
             // MLP
             if let fc1Weight = weights["\(blockPrefix).mlp.fc1.weight"] {
-                model.visionTower.layers[i].mlp.gate.weight = fc1Weight
+                model.visionTower.layers[i].mlp.gate.update(parameters: ModuleParameters(["weight": fc1Weight]))
             }
             if let fc2Weight = weights["\(blockPrefix).mlp.fc2.weight"] {
-                model.visionTower.layers[i].mlp.down.weight = fc2Weight
+                model.visionTower.layers[i].mlp.down.update(parameters: ModuleParameters(["weight": fc2Weight]))
             }
             
             // Layer norms
             if let norm1Weight = weights["\(blockPrefix).norm1.weight"] {
-                model.visionTower.layers[i].norm1.weight = norm1Weight
+                model.visionTower.layers[i].norm1.update(parameters: ModuleParameters(["weight": norm1Weight]))
             }
             if let norm2Weight = weights["\(blockPrefix).norm2.weight"] {
-                model.visionTower.layers[i].norm2.weight = norm2Weight
+                model.visionTower.layers[i].norm2.update(parameters: ModuleParameters(["weight": norm2Weight]))
             }
         }
         
         // Final norm
         if let normWeight = weights["\(visionPrefix).norm.weight"] {
-            model.visionTower.norm.weight = normWeight
+            model.visionTower.norm.update(parameters: ModuleParameters(["weight": normWeight]))
         }
     }
     
     /// 加载投影层权重
     private func loadProjectorWeights(_ weights: [String: MLXArray]) {
         if let projectorWeight = weights["visual_projection.weight"] {
-            model.visualProjector.weight = projectorWeight
+            model.visualProjector.update(parameters: ModuleParameters(["weight": projectorWeight]))
         }
     }
     
@@ -282,9 +282,9 @@ public class Qwen25VLInferencePipeline {
         )
         let centeredImage = scaledImage.transformed(by: centeredTransform)
         
-        // 转换为 RGB 数组
+        // 转换为 RGBA 数组
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        let bytesPerPixel = 3
+        let bytesPerPixel = 4
         let bytesPerRow = targetSize * bytesPerPixel
         var pixelData = [UInt8](repeating: 0, count: targetSize * targetSize * bytesPerPixel)
         
@@ -293,7 +293,7 @@ public class Qwen25VLInferencePipeline {
             toBitmap: &pixelData,
             rowBytes: bytesPerRow,
             bounds: targetRect,
-            format: .RGB8,
+            format: .RGBA8,
             colorSpace: colorSpace
         )
         
@@ -304,7 +304,7 @@ public class Qwen25VLInferencePipeline {
         for c in 0..<3 {
             for h in 0..<targetSize {
                 for w in 0..<targetSize {
-                    let srcIndex = h * targetSize * 3 + w * 3 + c
+                    let srcIndex = h * targetSize * 4 + w * 4 + c  // RGBA format
                     let dstIndex = c * targetSize * targetSize + h * targetSize + w
                     chwData[dstIndex] = normalizedData[srcIndex]
                 }
@@ -469,24 +469,56 @@ public class Qwen25VLInferencePipeline {
     /// Token 采样
     private func sampleToken(logits: MLXArray, temperature: Float, topP: Float) -> Int {
         let scaledLogits = logits / temperature
-        let probs = softmax(scaledLogits)
+        let probs = softmax(scaledLogits, axis: -1)
         
         if topP < 1.0 {
-            // Top-p 采样
-            let sortedIndices = argsort(probs, axis: -1)
-            let sortedProbs = probs[sortedIndices]
-            let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+            // 简化的 top-p 采样实现
+            let probsArray = probs.asArray(Float.self)
+            let vocabSize = probsArray.count
             
-            // 找到累积概率超过 topP 的位置
-            let mask = cumulativeProbs <= topP
-            let filteredProbs = where(mask, sortedProbs, 0.0)
-            let normalizedProbs = filteredProbs / sum(filteredProbs)
+            // 创建概率和索引的配对数组
+            var probIndexPairs = [(Float, Int)]()
+            for i in 0..<vocabSize {
+                probIndexPairs.append((probsArray[i], i))
+            }
             
-            // 从过滤后的分布中采样
-            return multinomial(normalizedProbs).item(Int.self)
+            // 按概率降序排序
+            probIndexPairs.sort { $0.0 > $1.0 }
+            
+            // 计算累积概率并找到 top-p 截止点
+            var cumulativeProb: Float = 0.0
+            var cutoffIndex = vocabSize
+            for i in 0..<vocabSize {
+                cumulativeProb += probIndexPairs[i].0
+                if cumulativeProb >= topP {
+                    cutoffIndex = i + 1
+                    break
+                }
+            }
+            
+            // 从 top-p 候选中随机选择
+            let randomValue = Float.random(in: 0..<cumulativeProb)
+            var accumulatedProb: Float = 0.0
+            for i in 0..<cutoffIndex {
+                accumulatedProb += probIndexPairs[i].0
+                if accumulatedProb >= randomValue {
+                    return probIndexPairs[i].1
+                }
+            }
+            return probIndexPairs[0].1
         } else {
-            // 普通多项式采样
-            return multinomial(probs).item(Int.self)
+            // 标准多项式采样
+            let probsArray = probs.asArray(Float.self)
+            let randomValue = Float.random(in: 0..<1.0)
+            var cumulativeProb: Float = 0.0
+            
+            for i in 0..<probsArray.count {
+                cumulativeProb += probsArray[i]
+                if cumulativeProb >= randomValue {
+                    return i
+                }
+            }
+            return probsArray.count - 1
         }
     }
     

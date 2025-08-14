@@ -191,7 +191,7 @@ public class VisionTransformer: Module {
         
         // 位置编码
         let numPatches = (config.windowSize / config.patchSize) * (config.windowSize / config.patchSize)
-        self.positionEmbedding = MLXArray.random(normal: [1, numPatches, config.hiddenSize])
+        self.positionEmbedding = MLXRandom.normal([1, numPatches, config.hiddenSize])
         
         // Transformer 层
         self.layers = (0..<config.depth).map { i in
@@ -225,7 +225,7 @@ public class VisionTransformer: Module {
         // Reshape 为 patches: [batch_size, num_patches, patch_dim]
         let patches = images
             .reshaped([batchSize, channels, numPatchesH, patchSize, numPatchesW, patchSize])
-            .transposed([0, 2, 4, 1, 3, 5])
+            .transposed(0, 2, 4, 1, 3, 5)
             .reshaped([batchSize, numPatchesH * numPatchesW, channels * patchSize * patchSize])
         
         // Patch embedding
@@ -261,7 +261,7 @@ public class VisionTransformerBlock: Module {
         
         self.attention = MultiHeadAttention(
             dimensions: config.hiddenSize,
-            numberOfHeads: config.numHeads,
+            numHeads: config.numHeads,
             bias: true
         )
         
@@ -279,7 +279,7 @@ public class VisionTransformerBlock: Module {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         // Self-attention with residual connection
         let normed1 = norm1(x)
-        let attended = attention(normed1, normed1, normed1)
+        let attended = attention(normed1, keys: normed1, values: normed1)
         let x1 = x + attended
         
         // MLP with residual connection
@@ -431,9 +431,9 @@ public class Qwen25Attention: Module {
         let B = x.shape[0]
         let L = x.shape[1]
         
-        let q = qProj(x).reshaped([B, L, numHeads, headDim]).transposed([0, 2, 1, 3])
-        let k = kProj(x).reshaped([B, L, numKeyValueHeads, headDim]).transposed([0, 2, 1, 3])
-        let v = vProj(x).reshaped([B, L, numKeyValueHeads, headDim]).transposed([0, 2, 1, 3])
+        let q = qProj(x).reshaped([B, L, numHeads, headDim]).transposed(0, 2, 1, 3)
+        let k = kProj(x).reshaped([B, L, numKeyValueHeads, headDim]).transposed(0, 2, 1, 3)
+        let v = vProj(x).reshaped([B, L, numKeyValueHeads, headDim]).transposed(0, 2, 1, 3)
         
         // 应用 RoPE
         let offset = cache?.keys.shape[2] ?? 0
@@ -455,7 +455,7 @@ public class Qwen25Attention: Module {
         
         // 计算注意力
         let output = scaledDotProductAttention(qRotated, kExpanded, vExpanded)
-        let reshaped = output.transposed([0, 2, 1, 3]).reshaped([B, L, numHeads * headDim])
+        let reshaped = output.transposed(0, 2, 1, 3).reshaped([B, L, numHeads * headDim])
         
         return (oProj(reshaped), updatedCache)
     }

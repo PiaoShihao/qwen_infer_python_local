@@ -95,24 +95,15 @@ fi
 
 # 构建示例程序 (仅在 macOS 下)
 if [[ "$DESTINATION" == "platform=macOS" ]]; then
-    echo "🏗️  构建示例程序..."
-    xcodebuild build \
-        -scheme QwenVLExample \
-        -destination "$DESTINATION" \
-        -configuration $BUILD_CONFIG \
-        -quiet
+    echo "🏗️  构建配置测试程序..."
+    swift build --target ConfigTest
 
     if [ $? -eq 0 ]; then
-        echo "✅ 示例程序构建成功"
-        
-        # 查找生成的可执行文件
-        EXECUTABLE_PATH=$(find .build -name "QwenVLExample" -type f 2>/dev/null | head -n1)
-        if [ -n "$EXECUTABLE_PATH" ]; then
-            echo "📁 可执行文件位置: $EXECUTABLE_PATH"
-            echo "🚀 运行示例程序: $EXECUTABLE_PATH"
-        fi
+        echo "✅ 配置测试程序构建成功"
+        echo "🚀 运行配置测试程序..."
+        swift run ConfigTest
     else
-        echo "❌ 示例程序构建失败"
+        echo "❌ 配置测试程序构建失败"
         exit 1
     fi
 fi
@@ -129,23 +120,3 @@ if [ $? -eq 0 ]; then
 else
     echo "⚠️  一些测试失败"
 fi
-
-echo ""
-echo "🎉 Qwen2.5-VL Swift 完整实现构建完成!"
-echo ""
-echo "📚 使用指南:"
-echo "  1. 这是完整的 Qwen2.5-VL 实现，包含："
-echo "     - 完整的模型架构 (Qwen25VLModel.swift)"
-echo "     - 推理管道 (Qwen25VLInferencePipeline.swift)"
-echo "     - 高级 API (QwenVLInference.swift)"
-echo "  2. 添加 mlx-swift 依赖到您的 Package.swift 或 Xcode 项目"
-echo "  3. 确保 Qwen2.5-VL-3B 模型文件在正确的路径下"
-echo "  4. 参考 Sources/QwenVLExample/QwenVLExample.swift 的使用示例"
-echo ""
-echo "🏗️ 架构特点:"
-echo "  - 严格按照 Qwen2.5-VL 架构实现"
-echo "  - 包含完整的 tokenization、image encoding、cross-modal attention"
-echo "  - 支持量化模型推理"
-echo "  - 真正的本地推理，无简化或模拟"
-echo ""
-echo "📖 更多信息请查看 README_Swift.md"

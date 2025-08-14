@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "QwenVLSwift",
     platforms: [
-        .macOS(.v13),
+        .macOS("13.3"),
         .iOS(.v16)
     ],
     products: [
@@ -17,6 +17,10 @@ let package = Package(
         .executable(
             name: "QwenVLExample",
             targets: ["QwenVLExample"]
+        ),
+        .executable(
+            name: "ConfigTest", 
+            targets: ["ConfigTest"]
         )
     ],
     dependencies: [
@@ -41,6 +45,13 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift")
             ],
             path: "Sources/QwenVLExample"
+        ),
+        .executableTarget(
+            name: "ConfigTest",
+            dependencies: [
+                "QwenVLSwift"
+            ],
+            path: "Sources/ConfigTest"
         ),
         .testTarget(
             name: "QwenVLSwiftTests",
