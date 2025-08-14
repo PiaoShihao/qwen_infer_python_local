@@ -1,7 +1,28 @@
+# MLX Vision Language Model 核心依赖
+mlx-vlm>=0.0.12
+
+# MLX 框架 (Apple Silicon 优化)
 mlx>=0.19.0
 mlx-lm>=0.19.0
-pillow>=10.0.0
-numpy>=1.24.0
-safetensors>=0.4.0
+
+# Transformers 和相关依赖
 transformers>=4.41.0
+tokenizers>=0.19.0
 sentencepiece>=0.2.0
+safetensors>=0.4.0
+
+# 图像处理
+pillow>=10.0.0
+
+# 数据处理
+numpy>=1.24.0
+
+# HTTP 请求（用于模型下载）
+requests>=2.28.0
+
+# 音频处理（用于多模态功能）
+soundfile>=0.12.0
+scipy>=1.10.0
+
+# Hugging Face Hub（用于模型下载）
+huggingface-hub>=0.20.0
