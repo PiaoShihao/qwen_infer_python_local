@@ -1,0 +1,644 @@
+// Copyright © 2024 Apple Inc.
+// Qwen2.5-VL 完整模型实现
+
+import Foundation
+import MLX
+import MLXNN
+import CoreImage
+
+// MARK: - Model Configuration
+
+/// Qwen2.5-VL 模型配置
+public struct Qwen25VLConfig {
+    // 文本模型配置
+    public let hiddenSize: Int
+    public let intermediateSize: Int
+    public let numHiddenLayers: Int
+    public let numAttentionHeads: Int
+    public let numKeyValueHeads: Int
+    public let maxPositionEmbeddings: Int
+    public let rmsNormEps: Float
+    public let ropeTheta: Float
+    public let slidingWindow: Int
+    public let vocabSize: Int
+    
+    // 视觉模型配置
+    public let visionConfig: VisionConfig
+    
+    // 特殊 token IDs
+    public let bosTokenId: Int
+    public let eosTokenId: Int
+    public let imageTokenId: Int
+    public let visionStartTokenId: Int
+    public let visionEndTokenId: Int
+    public let visionTokenId: Int
+    
+    // 量化配置
+    public let quantization: QuantizationConfig?
+    
+    public struct VisionConfig {
+        public let depth: Int
+        public let hiddenSize: Int
+        public let intermediateSize: Int
+        public let numHeads: Int
+        public let inChannels: Int
+        public let outHiddenSize: Int
+        public let patchSize: Int
+        public let spatialMergeSize: Int
+        public let windowSize: Int
+        public let fullattBlockIndexes: [Int]
+    }
+    
+    public struct QuantizationConfig {
+        public let groupSize: Int
+        public let bits: Int
+    }
+}
+
+// MARK: - Tokenizer Implementation
+
+/// Qwen2.5 Tokenizer 实现
+public class Qwen25Tokenizer {
+    private let vocabSize: Int
+    private let specialTokens: [String: Int]
+    private let vocab: [String: Int]
+    private let merges: [(String, String)]
+    
+    public init(vocabFile: String, mergesFile: String, specialTokens: [String: Int]) throws {
+        self.specialTokens = specialTokens
+        self.vocabSize = specialTokens.values.max() ?? 0 + 1
+        
+        // 加载词汇表
+        let vocabData = try Data(contentsOf: URL(fileURLWithPath: vocabFile))
+        let vocabJson = try JSONSerialization.jsonObject(with: vocabData) as! [String: Int]
+        self.vocab = vocabJson
+        
+        // 加载 BPE merges
+        let mergesContent = try String(contentsOfFile: mergesFile)
+        let mergeLines = mergesContent.components(separatedBy: .newlines).dropFirst()
+        self.merges = mergeLines.compactMap { line in
+            let parts = line.components(separatedBy: " ")
+            guard parts.count == 2 else { return nil }
+            return (parts[0], parts[1])
+        }
+    }
+    
+    /// BPE 编码实现
+    private func bpeEncode(_ text: String) -> [String] {
+        var word = Array(text).map { String($0) }
+        
+        while true {
+            let pairs = zip(word.dropLast(), word.dropFirst()).map { ($0, $1) }
+            
+            let validPairs = pairs.enumerated().compactMap { (index, pair) -> (Int, Int)? in
+                if let mergeIndex = merges.firstIndex(where: { $0 == pair }) {
+                    return (index, mergeIndex)
+                }
+                return nil
+            }
+            
+            guard let (bestPairIndex, _) = validPairs.min(by: { $0.1 < $1.1 }) else {
+                break
+            }
+            
+            let newToken = word[bestPairIndex] + word[bestPairIndex + 1]
+            var newWord: [String] = []
+            
+            var i = 0
+            while i < word.count {
+                if i == bestPairIndex {
+                    newWord.append(newToken)
+                    i += 2
+                } else {
+                    newWord.append(word[i])
+                    i += 1
+                }
+            }
+            word = newWord
+        }
+        
+        return word
+    }
+    
+    /// 编码文本为 token IDs
+    public func encode(_ text: String, addSpecialTokens: Bool = true) -> [Int] {
+        // 处理特殊 tokens
+        var processedText = text
+        var specialTokenPositions: [(range: Range<String.Index>, tokenId: Int)] = []
+        
+        for (token, id) in specialTokens.sorted(by: { $0.key.count > $1.key.count }) {
+            let ranges = processedText.ranges(of: token)
+            for range in ranges {
+                specialTokenPositions.append((range: range, tokenId: id))
+            }
+        }
+        
+        // 分割文本并编码
+        var result: [Int] = []
+        var lastIndex = processedText.startIndex
+        
+        for (range, tokenId) in specialTokenPositions.sorted(by: { $0.range.lowerBound < $1.range.lowerBound }) {
+            // 编码特殊 token 之前的文本
+            if lastIndex < range.lowerBound {
+                let beforeText = String(processedText[lastIndex..<range.lowerBound])
+                let tokens = bpeEncode(beforeText)
+                result.append(contentsOf: tokens.compactMap { vocab[$0] })
+            }
+            
+            // 添加特殊 token
+            result.append(tokenId)
+            lastIndex = range.upperBound
+        }
+        
+        // 处理剩余文本
+        if lastIndex < processedText.endIndex {
+            let remainingText = String(processedText[lastIndex...])
+            let tokens = bpeEncode(remainingText)
+            result.append(contentsOf: tokens.compactMap { vocab[$0] })
+        }
+        
+        return result
+    }
+    
+    /// 解码 token IDs 为文本
+    public func decode(_ tokenIds: [Int]) -> String {
+        let reverseVocab = Dictionary(uniqueKeysWithValues: vocab.map { ($1, $0) })
+        let reverseSpecialTokens = Dictionary(uniqueKeysWithValues: specialTokens.map { ($1, $0) })
+        
+        return tokenIds.compactMap { id in
+            reverseSpecialTokens[id] ?? reverseVocab[id]
+        }.joined()
+    }
+}
+
+// MARK: - Vision Transformer Implementation
+
+/// 视觉 Transformer 编码器
+public class VisionTransformer: Module {
+    let config: Qwen25VLConfig.VisionConfig
+    let patchEmbedding: Linear
+    let positionEmbedding: MLXArray
+    let layers: [VisionTransformerBlock]
+    let norm: RMSNorm
+    let pooler: Linear
+    
+    public init(config: Qwen25VLConfig.VisionConfig) {
+        self.config = config
+        
+        // Patch embedding: 将图片分割成 patches 并投影到隐藏维度
+        let patchDim = config.patchSize * config.patchSize * config.inChannels
+        self.patchEmbedding = Linear(patchDim, config.hiddenSize)
+        
+        // 位置编码
+        let numPatches = (config.windowSize / config.patchSize) * (config.windowSize / config.patchSize)
+        self.positionEmbedding = MLXArray.random(normal: [1, numPatches, config.hiddenSize])
+        
+        // Transformer 层
+        self.layers = (0..<config.depth).map { i in
+            VisionTransformerBlock(
+                config: config,
+                useFullAttention: config.fullattBlockIndexes.contains(i)
+            )
+        }
+        
+        // 最终 normalization
+        self.norm = RMSNorm(dimensions: config.hiddenSize, eps: 1e-6)
+        
+        // 输出投影到文本模型维度
+        self.pooler = Linear(config.hiddenSize, config.outHiddenSize)
+        
+        super.init()
+    }
+    
+    public func callAsFunction(_ images: MLXArray) -> MLXArray {
+        // images shape: [batch_size, channels, height, width]
+        let batchSize = images.shape[0]
+        let channels = images.shape[1]
+        let height = images.shape[2]
+        let width = images.shape[3]
+        
+        // 分割成 patches
+        let patchSize = config.patchSize
+        let numPatchesH = height / patchSize
+        let numPatchesW = width / patchSize
+        
+        // Reshape 为 patches: [batch_size, num_patches, patch_dim]
+        let patches = images
+            .reshaped([batchSize, channels, numPatchesH, patchSize, numPatchesW, patchSize])
+            .transposed([0, 2, 4, 1, 3, 5])
+            .reshaped([batchSize, numPatchesH * numPatchesW, channels * patchSize * patchSize])
+        
+        // Patch embedding
+        var x = patchEmbedding(patches)
+        
+        // 添加位置编码
+        x = x + positionEmbedding
+        
+        // 通过 Transformer 层
+        for layer in layers {
+            x = layer(x)
+        }
+        
+        // 最终 normalization
+        x = norm(x)
+        
+        // 池化并投影
+        let pooled = x.mean(axis: 1) // Global average pooling
+        return pooler(pooled)
+    }
+}
+
+/// Vision Transformer Block
+public class VisionTransformerBlock: Module {
+    let attention: MultiHeadAttention
+    let mlp: VisionMLP
+    let norm1: RMSNorm
+    let norm2: RMSNorm
+    let useFullAttention: Bool
+    
+    public init(config: Qwen25VLConfig.VisionConfig, useFullAttention: Bool) {
+        self.useFullAttention = useFullAttention
+        
+        self.attention = MultiHeadAttention(
+            dimensions: config.hiddenSize,
+            numberOfHeads: config.numHeads,
+            bias: true
+        )
+        
+        self.mlp = VisionMLP(
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.intermediateSize
+        )
+        
+        self.norm1 = RMSNorm(dimensions: config.hiddenSize, eps: 1e-6)
+        self.norm2 = RMSNorm(dimensions: config.hiddenSize, eps: 1e-6)
+        
+        super.init()
+    }
+    
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Self-attention with residual connection
+        let normed1 = norm1(x)
+        let attended = attention(normed1, normed1, normed1)
+        let x1 = x + attended
+        
+        // MLP with residual connection
+        let normed2 = norm2(x1)
+        let mlpOutput = mlp(normed2)
+        return x1 + mlpOutput
+    }
+}
+
+/// Vision MLP
+public class VisionMLP: Module {
+    let gate: Linear
+    let up: Linear
+    let down: Linear
+    
+    public init(hiddenSize: Int, intermediateSize: Int) {
+        self.gate = Linear(hiddenSize, intermediateSize, bias: false)
+        self.up = Linear(hiddenSize, intermediateSize, bias: false)
+        self.down = Linear(intermediateSize, hiddenSize, bias: false)
+        
+        super.init()
+    }
+    
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let gated = silu(gate(x))
+        let up_proj = up(x)
+        return down(gated * up_proj)
+    }
+}
+
+// MARK: - Text Model Implementation
+
+/// Qwen2.5 语言模型
+public class Qwen25LanguageModel: Module {
+    let config: Qwen25VLConfig
+    let embedding: Embedding
+    let layers: [Qwen25DecoderLayer]
+    let norm: RMSNorm
+    let lmHead: Linear
+    
+    public init(config: Qwen25VLConfig) {
+        self.config = config
+        
+        self.embedding = Embedding(
+            embeddingCount: config.vocabSize,
+            dimensions: config.hiddenSize
+        )
+        
+        self.layers = (0..<config.numHiddenLayers).map { _ in
+            Qwen25DecoderLayer(config: config)
+        }
+        
+        self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.lmHead = Linear(config.hiddenSize, config.vocabSize, bias: false)
+        
+        super.init()
+    }
+    
+    public func callAsFunction(
+        _ inputIds: MLXArray,
+        cache: [KVCache]? = nil
+    ) -> (MLXArray, [KVCache]) {
+        var x = embedding(inputIds)
+        
+        var newCache: [KVCache] = []
+        
+        for (i, layer) in layers.enumerated() {
+            let layerCache = cache?[i]
+            let (output, updatedCache) = layer(x, cache: layerCache)
+            x = output
+            newCache.append(updatedCache)
+        }
+        
+        x = norm(x)
+        let logits = lmHead(x)
+        
+        return (logits, newCache)
+    }
+}
+
+/// Qwen2.5 Decoder Layer
+public class Qwen25DecoderLayer: Module {
+    let selfAttention: Qwen25Attention
+    let mlp: Qwen25MLP
+    let inputLayerNorm: RMSNorm
+    let postAttentionLayerNorm: RMSNorm
+    
+    public init(config: Qwen25VLConfig) {
+        self.selfAttention = Qwen25Attention(config: config)
+        self.mlp = Qwen25MLP(config: config)
+        self.inputLayerNorm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.postAttentionLayerNorm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        
+        super.init()
+    }
+    
+    public func callAsFunction(
+        _ x: MLXArray,
+        cache: KVCache? = nil
+    ) -> (MLXArray, KVCache) {
+        // Self-attention with residual connection
+        let normed = inputLayerNorm(x)
+        let (attended, newCache) = selfAttention(normed, cache: cache)
+        let x1 = x + attended
+        
+        // MLP with residual connection
+        let normed2 = postAttentionLayerNorm(x1)
+        let mlpOutput = mlp(normed2)
+        return (x1 + mlpOutput, newCache)
+    }
+}
+
+/// Qwen2.5 Multi-Head Attention with RoPE
+public class Qwen25Attention: Module {
+    let config: Qwen25VLConfig
+    let numHeads: Int
+    let numKeyValueHeads: Int
+    let headDim: Int
+    let qProj: Linear
+    let kProj: Linear
+    let vProj: Linear
+    let oProj: Linear
+    let rope: RoPE
+    
+    public init(config: Qwen25VLConfig) {
+        self.config = config
+        self.numHeads = config.numAttentionHeads
+        self.numKeyValueHeads = config.numKeyValueHeads
+        self.headDim = config.hiddenSize / numHeads
+        
+        self.qProj = Linear(config.hiddenSize, numHeads * headDim, bias: true)
+        self.kProj = Linear(config.hiddenSize, numKeyValueHeads * headDim, bias: true)
+        self.vProj = Linear(config.hiddenSize, numKeyValueHeads * headDim, bias: true)
+        self.oProj = Linear(numHeads * headDim, config.hiddenSize, bias: false)
+        
+        self.rope = RoPE(
+            dimensions: headDim,
+            traditional: false,
+            base: config.ropeTheta
+        )
+        
+        super.init()
+    }
+    
+    public func callAsFunction(
+        _ x: MLXArray,
+        cache: KVCache? = nil
+    ) -> (MLXArray, KVCache) {
+        let B = x.shape[0]
+        let L = x.shape[1]
+        
+        let q = qProj(x).reshaped([B, L, numHeads, headDim]).transposed([0, 2, 1, 3])
+        let k = kProj(x).reshaped([B, L, numKeyValueHeads, headDim]).transposed([0, 2, 1, 3])
+        let v = vProj(x).reshaped([B, L, numKeyValueHeads, headDim]).transposed([0, 2, 1, 3])
+        
+        // 应用 RoPE
+        let offset = cache?.keys.shape[2] ?? 0
+        let (qRotated, kRotated) = rope(q, k, offset: offset)
+        
+        // 更新或创建 cache
+        let updatedCache: KVCache
+        if let existingCache = cache {
+            let newKeys = concatenated([existingCache.keys, kRotated], axis: 2)
+            let newValues = concatenated([existingCache.values, v], axis: 2)
+            updatedCache = KVCache(keys: newKeys, values: newValues)
+        } else {
+            updatedCache = KVCache(keys: kRotated, values: v)
+        }
+        
+        // 扩展 k, v 以匹配查询头数 (GQA)
+        let kExpanded = expandKeyValue(updatedCache.keys)
+        let vExpanded = expandKeyValue(updatedCache.values)
+        
+        // 计算注意力
+        let output = scaledDotProductAttention(qRotated, kExpanded, vExpanded)
+        let reshaped = output.transposed([0, 2, 1, 3]).reshaped([B, L, numHeads * headDim])
+        
+        return (oProj(reshaped), updatedCache)
+    }
+    
+    private func expandKeyValue(_ kv: MLXArray) -> MLXArray {
+        let B = kv.shape[0]
+        let numKVHeads = kv.shape[1]
+        let L = kv.shape[2]
+        let headDim = kv.shape[3]
+        
+        let numReps = numHeads / numKVHeads
+        
+        if numReps == 1 {
+            return kv
+        }
+        
+        return kv
+            .reshaped([B, numKVHeads, 1, L, headDim])
+            .broadcast(to: [B, numKVHeads, numReps, L, headDim])
+            .reshaped([B, numHeads, L, headDim])
+    }
+}
+
+/// Qwen2.5 MLP with SwiGLU activation
+public class Qwen25MLP: Module {
+    let gateProj: Linear
+    let upProj: Linear
+    let downProj: Linear
+    
+    public init(config: Qwen25VLConfig) {
+        self.gateProj = Linear(config.hiddenSize, config.intermediateSize, bias: false)
+        self.upProj = Linear(config.hiddenSize, config.intermediateSize, bias: false)
+        self.downProj = Linear(config.intermediateSize, config.hiddenSize, bias: false)
+        
+        super.init()
+    }
+    
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let gate = silu(gateProj(x))
+        let up = upProj(x)
+        return downProj(gate * up)
+    }
+}
+
+// MARK: - Multi-Modal Integration
+
+/// Qwen2.5-VL 完整多模态模型
+public class Qwen25VLForConditionalGeneration: Module {
+    let config: Qwen25VLConfig
+    let languageModel: Qwen25LanguageModel
+    let visionTower: VisionTransformer
+    let visualProjector: Linear
+    
+    public init(config: Qwen25VLConfig) {
+        self.config = config
+        self.languageModel = Qwen25LanguageModel(config: config)
+        self.visionTower = VisionTransformer(config: config.visionConfig)
+        self.visualProjector = Linear(
+            config.visionConfig.outHiddenSize,
+            config.hiddenSize
+        )
+        
+        super.init()
+    }
+    
+    /// 处理图片，提取视觉特征
+    public func encodeImages(_ images: MLXArray) -> MLXArray {
+        let imageFeatures = visionTower(images)
+        return visualProjector(imageFeatures)
+    }
+    
+    /// 构建多模态输入序列
+    public func buildMultimodalInputs(
+        inputIds: [Int],
+        imageFeatures: MLXArray?,
+        tokenizer: Qwen25Tokenizer
+    ) -> MLXArray {
+        var processedTokens = inputIds
+        
+        if let imageFeatures = imageFeatures {
+            // 找到 vision token 的位置
+            if let visionStartIndex = processedTokens.firstIndex(of: config.visionStartTokenId),
+               let visionEndIndex = processedTokens.firstIndex(of: config.visionEndTokenId) {
+                
+                // 计算需要插入的 image tokens 数量
+                let numImageTokens = imageFeatures.shape[0] // 假设 batch size = 1
+                let imageTokenIds = Array(repeating: config.imageTokenId, count: numImageTokens)
+                
+                // 替换 vision tokens
+                processedTokens.replaceSubrange(
+                    visionStartIndex...visionEndIndex,
+                    with: [config.visionStartTokenId] + imageTokenIds + [config.visionEndTokenId]
+                )
+            }
+        }
+        
+        return MLXArray(processedTokens.map { Int32($0) }).reshaped([1, -1])
+    }
+    
+    /// 前向传播
+    public func callAsFunction(
+        inputIds: MLXArray,
+        imageFeatures: MLXArray? = nil,
+        cache: [KVCache]? = nil
+    ) -> (MLXArray, [KVCache]) {
+        // 如果有图片特征，需要将其嵌入到 token embeddings 中
+        var embeddings = languageModel.embedding(inputIds)
+        
+        if let imageFeatures = imageFeatures {
+            // 找到 image token 位置并替换
+            let imageTokenPositions = findImageTokenPositions(inputIds)
+            embeddings = replaceImageTokens(embeddings, imageFeatures, imageTokenPositions)
+        }
+        
+        // 通过语言模型层
+        var x = embeddings
+        var newCache: [KVCache] = []
+        
+        for (i, layer) in languageModel.layers.enumerated() {
+            let layerCache = cache?[i]
+            let (output, updatedCache) = layer(x, cache: layerCache)
+            x = output
+            newCache.append(updatedCache)
+        }
+        
+        x = languageModel.norm(x)
+        let logits = languageModel.lmHead(x)
+        
+        return (logits, newCache)
+    }
+    
+    /// 查找图片 token 位置
+    private func findImageTokenPositions(_ inputIds: MLXArray) -> [Int] {
+        let tokens = inputIds.reshaped([-1]).asArray(Int32.self)
+        return tokens.enumerated().compactMap { (index, token) in
+            token == config.imageTokenId ? index : nil
+        }
+    }
+    
+    /// 替换图片 token 为实际图片特征
+    private func replaceImageTokens(
+        _ embeddings: MLXArray,
+        _ imageFeatures: MLXArray,
+        _ positions: [Int]
+    ) -> MLXArray {
+        var result = embeddings
+        
+        for (i, position) in positions.enumerated() {
+            if i < imageFeatures.shape[0] {
+                let imageFeature = imageFeatures[i].reshaped([1, -1])
+                result = result.updated(indices: [position], with: imageFeature)
+            }
+        }
+        
+        return result
+    }
+}
+
+// MARK: - Helper Structures
+
+/// KV Cache for attention
+public struct KVCache {
+    public let keys: MLXArray
+    public let values: MLXArray
+    
+    public init(keys: MLXArray, values: MLXArray) {
+        self.keys = keys
+        self.values = values
+    }
+}
+
+// MARK: - Extensions
+
+extension String {
+    func ranges(of substring: String) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var searchRange = self.startIndex..<self.endIndex
+        
+        while let range = self.range(of: substring, range: searchRange) {
+            ranges.append(range)
+            searchRange = range.upperBound..<self.endIndex
+        }
+        
+        return ranges
+    }
+}

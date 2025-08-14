@@ -1,0 +1,498 @@
+// Copyright © 2024 Apple Inc.
+// Qwen2.5-VL 完整推理管道
+
+import Foundation
+import MLX
+import MLXNN
+import CoreImage
+import Vision
+
+/// Qwen2.5-VL 推理管道
+public class Qwen25VLInferencePipeline {
+    private let model: Qwen25VLForConditionalGeneration
+    private let tokenizer: Qwen25Tokenizer
+    private let config: Qwen25VLConfig
+    private var cache: [KVCache]?
+    
+    /// 初始化推理管道
+    /// - Parameter modelPath: 模型文件路径
+    public init(modelPath: String) throws {
+        // 加载配置
+        let configPath = "\(modelPath)/config.json"
+        let configData = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        let configJson = try JSONSerialization.jsonObject(with: configData) as! [String: Any]
+        self.config = try Self.parseConfig(configJson)
+        
+        // 初始化模型
+        self.model = Qwen25VLForConditionalGeneration(config: config)
+        
+        // 加载模型权重
+        try loadModelWeights(modelPath: modelPath)
+        
+        // 初始化 tokenizer
+        let vocabPath = "\(modelPath)/vocab.json"
+        let mergesPath = "\(modelPath)/merges.txt"
+        let tokenizerConfigPath = "\(modelPath)/tokenizer_config.json"
+        let specialTokens = try Self.loadSpecialTokens(tokenizerConfigPath)
+        
+        self.tokenizer = try Qwen25Tokenizer(
+            vocabFile: vocabPath,
+            mergesFile: mergesPath,
+            specialTokens: specialTokens
+        )
+        
+        print("Qwen2.5-VL 模型加载完成")
+    }
+    
+    /// 解析模型配置
+    private static func parseConfig(_ configJson: [String: Any]) throws -> Qwen25VLConfig {
+        let visionConfigDict = configJson["vision_config"] as! [String: Any]
+        
+        let visionConfig = Qwen25VLConfig.VisionConfig(
+            depth: visionConfigDict["depth"] as! Int,
+            hiddenSize: visionConfigDict["hidden_size"] as! Int,
+            intermediateSize: visionConfigDict["intermediate_size"] as! Int,
+            numHeads: visionConfigDict["num_heads"] as! Int,
+            inChannels: visionConfigDict["in_chans"] as! Int,
+            outHiddenSize: visionConfigDict["out_hidden_size"] as! Int,
+            patchSize: visionConfigDict["patch_size"] as! Int,
+            spatialMergeSize: visionConfigDict["spatial_merge_size"] as! Int,
+            windowSize: visionConfigDict["window_size"] as! Int,
+            fullattBlockIndexes: visionConfigDict["fullatt_block_indexes"] as! [Int]
+        )
+        
+        var quantization: Qwen25VLConfig.QuantizationConfig?
+        if let quantDict = configJson["quantization"] as? [String: Any] {
+            quantization = Qwen25VLConfig.QuantizationConfig(
+                groupSize: quantDict["group_size"] as! Int,
+                bits: quantDict["bits"] as! Int
+            )
+        }
+        
+        return Qwen25VLConfig(
+            hiddenSize: configJson["hidden_size"] as! Int,
+            intermediateSize: configJson["intermediate_size"] as! Int,
+            numHiddenLayers: configJson["num_hidden_layers"] as! Int,
+            numAttentionHeads: configJson["num_attention_heads"] as! Int,
+            numKeyValueHeads: configJson["num_key_value_heads"] as! Int,
+            maxPositionEmbeddings: configJson["max_position_embeddings"] as! Int,
+            rmsNormEps: Float(configJson["rms_norm_eps"] as! Double),
+            ropeTheta: Float(configJson["rope_theta"] as! Double),
+            slidingWindow: configJson["sliding_window"] as! Int,
+            vocabSize: configJson["vocab_size"] as! Int,
+            visionConfig: visionConfig,
+            bosTokenId: configJson["bos_token_id"] as! Int,
+            eosTokenId: configJson["eos_token_id"] as! Int,
+            imageTokenId: configJson["image_token_id"] as! Int,
+            visionStartTokenId: configJson["vision_start_token_id"] as! Int,
+            visionEndTokenId: configJson["vision_end_token_id"] as! Int,
+            visionTokenId: configJson["vision_token_id"] as! Int,
+            quantization: quantization
+        )
+    }
+    
+    /// 加载特殊 tokens
+    private static func loadSpecialTokens(_ tokenizerConfigPath: String) throws -> [String: Int] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: tokenizerConfigPath))
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let addedTokensDecoder = json["added_tokens_decoder"] as! [String: [String: Any]]
+        
+        var specialTokens: [String: Int] = [:]
+        for (idStr, tokenInfo) in addedTokensDecoder {
+            if let id = Int(idStr),
+               let content = tokenInfo["content"] as? String {
+                specialTokens[content] = id
+            }
+        }
+        
+        return specialTokens
+    }
+    
+    /// 加载模型权重
+    private func loadModelWeights(modelPath: String) throws {
+        let modelFile = "\(modelPath)/model.safetensors"
+        
+        guard FileManager.default.fileExists(atPath: modelFile) else {
+            throw QwenVLError.modelLoadFailed("模型文件不存在: \(modelFile)")
+        }
+        
+        // 使用 MLX 的 loadArrays 函数加载权重
+        let modelURL = URL(fileURLWithPath: modelFile)
+        let weights = try loadArrays(url: modelURL)
+        
+        // 加载权重到模型中
+        try loadWeightsIntoModel(weights)
+        
+        print("模型权重加载完成，共 \(weights.count) 个参数")
+    }
+    
+    /// 将权重加载到模型中
+    private func loadWeightsIntoModel(_ weights: [String: MLXArray]) throws {
+        // 这里需要根据权重的命名约定来映射到模型参数
+        // 语言模型权重
+        loadLanguageModelWeights(weights)
+        
+        // 视觉模型权重
+        loadVisionModelWeights(weights)
+        
+        // 投影层权重
+        loadProjectorWeights(weights)
+    }
+    
+    /// 加载语言模型权重
+    private func loadLanguageModelWeights(_ weights: [String: MLXArray]) {
+        // Embedding
+        if let embeddingWeight = weights["language_model.model.embed_tokens.weight"] {
+            model.languageModel.embedding.weight = embeddingWeight
+        }
+        
+        // Decoder layers
+        for i in 0..<config.numHiddenLayers {
+            let layerPrefix = "language_model.model.layers.\(i)"
+            
+            // Self attention
+            if let qWeight = weights["\(layerPrefix).self_attn.q_proj.weight"] {
+                model.languageModel.layers[i].selfAttention.qProj.weight = qWeight
+            }
+            if let kWeight = weights["\(layerPrefix).self_attn.k_proj.weight"] {
+                model.languageModel.layers[i].selfAttention.kProj.weight = kWeight
+            }
+            if let vWeight = weights["\(layerPrefix).self_attn.v_proj.weight"] {
+                model.languageModel.layers[i].selfAttention.vProj.weight = vWeight
+            }
+            if let oWeight = weights["\(layerPrefix).self_attn.o_proj.weight"] {
+                model.languageModel.layers[i].selfAttention.oProj.weight = oWeight
+            }
+            
+            // MLP
+            if let gateWeight = weights["\(layerPrefix).mlp.gate_proj.weight"] {
+                model.languageModel.layers[i].mlp.gateProj.weight = gateWeight
+            }
+            if let upWeight = weights["\(layerPrefix).mlp.up_proj.weight"] {
+                model.languageModel.layers[i].mlp.upProj.weight = upWeight
+            }
+            if let downWeight = weights["\(layerPrefix).mlp.down_proj.weight"] {
+                model.languageModel.layers[i].mlp.downProj.weight = downWeight
+            }
+            
+            // Layer norms
+            if let inputNormWeight = weights["\(layerPrefix).input_layernorm.weight"] {
+                model.languageModel.layers[i].inputLayerNorm.weight = inputNormWeight
+            }
+            if let postNormWeight = weights["\(layerPrefix).post_attention_layernorm.weight"] {
+                model.languageModel.layers[i].postAttentionLayerNorm.weight = postNormWeight
+            }
+        }
+        
+        // Final norm and lm_head
+        if let normWeight = weights["language_model.model.norm.weight"] {
+            model.languageModel.norm.weight = normWeight
+        }
+        if let lmHeadWeight = weights["language_model.lm_head.weight"] {
+            model.languageModel.lmHead.weight = lmHeadWeight
+        }
+    }
+    
+    /// 加载视觉模型权重
+    private func loadVisionModelWeights(_ weights: [String: MLXArray]) {
+        let visionPrefix = "visual"
+        
+        // Patch embedding
+        if let patchWeight = weights["\(visionPrefix).patch_embed.proj.weight"] {
+            model.visionTower.patchEmbedding.weight = patchWeight
+        }
+        
+        // Position embedding
+        if let posEmbed = weights["\(visionPrefix).pos_embed"] {
+            model.visionTower.positionEmbedding = posEmbed
+        }
+        
+        // Vision transformer blocks
+        for i in 0..<config.visionConfig.depth {
+            let blockPrefix = "\(visionPrefix).blocks.\(i)"
+            
+            // Attention
+            if let qkvWeight = weights["\(blockPrefix).attn.qkv.weight"] {
+                // 分离 q, k, v 权重
+                let dimPerHead = config.visionConfig.hiddenSize / config.visionConfig.numHeads
+                let qWeight = qkvWeight[0..<config.visionConfig.hiddenSize]
+                let kWeight = qkvWeight[config.visionConfig.hiddenSize..<(2*config.visionConfig.hiddenSize)]
+                let vWeight = qkvWeight[(2*config.visionConfig.hiddenSize)..<(3*config.visionConfig.hiddenSize)]
+                
+                // 设置权重（注意：这里需要根据实际的 MultiHeadAttention 实现调整）
+                // model.visionTower.layers[i].attention.queryProjection.weight = qWeight
+                // model.visionTower.layers[i].attention.keyProjection.weight = kWeight
+                // model.visionTower.layers[i].attention.valueProjection.weight = vWeight
+            }
+            
+            if let projWeight = weights["\(blockPrefix).attn.proj.weight"] {
+                // model.visionTower.layers[i].attention.outputProjection.weight = projWeight
+            }
+            
+            // MLP
+            if let fc1Weight = weights["\(blockPrefix).mlp.fc1.weight"] {
+                model.visionTower.layers[i].mlp.gate.weight = fc1Weight
+            }
+            if let fc2Weight = weights["\(blockPrefix).mlp.fc2.weight"] {
+                model.visionTower.layers[i].mlp.down.weight = fc2Weight
+            }
+            
+            // Layer norms
+            if let norm1Weight = weights["\(blockPrefix).norm1.weight"] {
+                model.visionTower.layers[i].norm1.weight = norm1Weight
+            }
+            if let norm2Weight = weights["\(blockPrefix).norm2.weight"] {
+                model.visionTower.layers[i].norm2.weight = norm2Weight
+            }
+        }
+        
+        // Final norm
+        if let normWeight = weights["\(visionPrefix).norm.weight"] {
+            model.visionTower.norm.weight = normWeight
+        }
+    }
+    
+    /// 加载投影层权重
+    private func loadProjectorWeights(_ weights: [String: MLXArray]) {
+        if let projectorWeight = weights["visual_projection.weight"] {
+            model.visualProjector.weight = projectorWeight
+        }
+    }
+    
+    /// 预处理图片
+    public func preprocessImage(_ image: CIImage, targetSize: Int = 448) -> MLXArray {
+        let context = CIContext()
+        
+        // 调整图片尺寸
+        let inputSize = image.extent
+        let scale = CGFloat(targetSize) / max(inputSize.width, inputSize.height)
+        let scaledSize = CGSize(
+            width: inputSize.width * scale,
+            height: inputSize.height * scale
+        )
+        
+        let transform = CGAffineTransform(scaleX: scale, y: scale)
+        let scaledImage = image.transformed(by: transform)
+        
+        // 中心裁剪或填充到目标尺寸
+        let targetRect = CGRect(x: 0, y: 0, width: targetSize, height: targetSize)
+        let centeredTransform = CGAffineTransform(
+            translationX: (CGFloat(targetSize) - scaledSize.width) / 2,
+            y: (CGFloat(targetSize) - scaledSize.height) / 2
+        )
+        let centeredImage = scaledImage.transformed(by: centeredTransform)
+        
+        // 转换为 RGB 数组
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let bytesPerPixel = 3
+        let bytesPerRow = targetSize * bytesPerPixel
+        var pixelData = [UInt8](repeating: 0, count: targetSize * targetSize * bytesPerPixel)
+        
+        context.render(
+            centeredImage,
+            toBitmap: &pixelData,
+            rowBytes: bytesPerRow,
+            bounds: targetRect,
+            format: .RGB8,
+            colorSpace: colorSpace
+        )
+        
+        // 标准化到 [0, 1] 并重排为 CHW 格式
+        let normalizedData = pixelData.map { Float($0) / 255.0 }
+        var chwData = [Float](repeating: 0, count: 3 * targetSize * targetSize)
+        
+        for c in 0..<3 {
+            for h in 0..<targetSize {
+                for w in 0..<targetSize {
+                    let srcIndex = h * targetSize * 3 + w * 3 + c
+                    let dstIndex = c * targetSize * targetSize + h * targetSize + w
+                    chwData[dstIndex] = normalizedData[srcIndex]
+                }
+            }
+        }
+        
+        // 应用 ImageNet 标准化
+        let mean: [Float] = [0.485, 0.456, 0.406]
+        let std: [Float] = [0.229, 0.224, 0.225]
+        
+        for c in 0..<3 {
+            for i in 0..<(targetSize * targetSize) {
+                let index = c * targetSize * targetSize + i
+                chwData[index] = (chwData[index] - mean[c]) / std[c]
+            }
+        }
+        
+        return MLXArray(chwData, [1, 3, targetSize, targetSize])
+    }
+    
+    /// 构建聊天模板
+    public func applyChatTemplate(prompt: String, hasImage: Bool = false) -> String {
+        var formattedPrompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        formattedPrompt += "<|im_start|>user\n"
+        
+        if hasImage {
+            formattedPrompt += "<|vision_start|><|image_pad|><|vision_end|>"
+        }
+        
+        formattedPrompt += prompt
+        formattedPrompt += "<|im_end|>\n<|im_start|>assistant\n"
+        
+        return formattedPrompt
+    }
+    
+    /// 生成文本（贪心解码）
+    public func generate(
+        prompt: String,
+        image: CIImage? = nil,
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.1,
+        topP: Float = 0.9
+    ) throws -> String {
+        let formattedPrompt = applyChatTemplate(prompt: prompt, hasImage: image != nil)
+        var inputIds = tokenizer.encode(formattedPrompt, addSpecialTokens: false)
+        
+        // 处理图片
+        var imageFeatures: MLXArray?
+        if let image = image {
+            let preprocessedImage = preprocessImage(image)
+            imageFeatures = model.encodeImages(preprocessedImage)
+        }
+        
+        // 构建多模态输入
+        let inputTensor = model.buildMultimodalInputs(
+            inputIds: inputIds,
+            imageFeatures: imageFeatures,
+            tokenizer: tokenizer
+        )
+        
+        var generatedTokens: [Int] = []
+        self.cache = nil
+        
+        // 生成循环
+        for _ in 0..<maxNewTokens {
+            let currentInput = generatedTokens.isEmpty ? inputTensor : MLXArray([Int32(generatedTokens.last!)]).reshaped([1, 1])
+            
+            let (logits, newCache) = model(
+                inputIds: currentInput,
+                imageFeatures: generatedTokens.isEmpty ? imageFeatures : nil,
+                cache: cache
+            )
+            
+            self.cache = newCache
+            
+            // 取最后一个位置的 logits
+            let nextTokenLogits = logits[0, -1, 0...]
+            
+            // 采样下一个 token
+            let nextToken = sampleToken(logits: nextTokenLogits, temperature: temperature, topP: topP)
+            
+            // 检查是否生成结束 token
+            if nextToken == config.eosTokenId {
+                break
+            }
+            
+            generatedTokens.append(nextToken)
+        }
+        
+        // 解码生成的 tokens
+        let generatedText = tokenizer.decode(generatedTokens)
+        return generatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    /// 流式生成文本
+    public func generateStream(
+        prompt: String,
+        image: CIImage? = nil,
+        maxNewTokens: Int = 512,
+        temperature: Float = 0.1,
+        topP: Float = 0.9,
+        completion: @escaping (String) -> Void
+    ) throws {
+        let formattedPrompt = applyChatTemplate(prompt: prompt, hasImage: image != nil)
+        let inputIds = tokenizer.encode(formattedPrompt, addSpecialTokens: false)
+        
+        // 处理图片
+        var imageFeatures: MLXArray?
+        if let image = image {
+            let preprocessedImage = preprocessImage(image)
+            imageFeatures = model.encodeImages(preprocessedImage)
+        }
+        
+        // 构建多模态输入
+        let inputTensor = model.buildMultimodalInputs(
+            inputIds: inputIds,
+            imageFeatures: imageFeatures,
+            tokenizer: tokenizer
+        )
+        
+        var generatedTokens: [Int] = []
+        self.cache = nil
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 生成循环
+            for _ in 0..<maxNewTokens {
+                let currentInput = generatedTokens.isEmpty ? inputTensor : MLXArray([Int32(generatedTokens.last!)]).reshaped([1, 1])
+                
+                let (logits, newCache) = self.model(
+                    inputIds: currentInput,
+                    imageFeatures: generatedTokens.isEmpty ? imageFeatures : nil,
+                    cache: self.cache
+                )
+                
+                self.cache = newCache
+                
+                // 取最后一个位置的 logits
+                let nextTokenLogits = logits[0, -1, 0...]
+                
+                // 采样下一个 token
+                let nextToken = self.sampleToken(logits: nextTokenLogits, temperature: temperature, topP: topP)
+                
+                // 检查是否生成结束 token
+                if nextToken == self.config.eosTokenId {
+                    break
+                }
+                
+                generatedTokens.append(nextToken)
+                
+                // 解码当前 token 并调用回调
+                let tokenText = self.tokenizer.decode([nextToken])
+                DispatchQueue.main.async {
+                    completion(tokenText)
+                }
+                
+                // 添加一些延迟以模拟真实的流式输出
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+    }
+    
+    /// Token 采样
+    private func sampleToken(logits: MLXArray, temperature: Float, topP: Float) -> Int {
+        let scaledLogits = logits / temperature
+        let probs = softmax(scaledLogits)
+        
+        if topP < 1.0 {
+            // Top-p 采样
+            let sortedIndices = argsort(probs, axis: -1)
+            let sortedProbs = probs[sortedIndices]
+            let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+            
+            // 找到累积概率超过 topP 的位置
+            let mask = cumulativeProbs <= topP
+            let filteredProbs = where(mask, sortedProbs, 0.0)
+            let normalizedProbs = filteredProbs / sum(filteredProbs)
+            
+            // 从过滤后的分布中采样
+            return multinomial(normalizedProbs).item(Int.self)
+        } else {
+            // 普通多项式采样
+            return multinomial(probs).item(Int.self)
+        }
+    }
+    
+    /// 清理缓存和内存
+    public func clearCache() {
+        self.cache = nil
+        eval([])  // 清理 MLX 计算图
+    }
+}
